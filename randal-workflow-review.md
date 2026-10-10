@@ -14,6 +14,66 @@ A workflow skill for an AI coding agent that moves one ticket from "pick it up" 
 
 Supporting practices: an orchestrator that never edits code itself and forks fresh-context workers (archaeology, TDD coder, read-only critic, bot triager); six hard human gates (plan, blocker triage, review sign-off, commit, push, land); a "Six Pillars" review rubric; a three-checkout circuit breaker; untrusted-text airlock for issue and PR text; never `git add .`, never `git checkout -B`, never `--no-verify`; verify `git merge-tree` against `origin/main` before pushing; write PR bodies to a file and use `--body-file`.
 
+## The two techniques the gist is really about
+
+The blog post "Surviving the 200k-Token Lobotomy" (Part 3.7 of his series) and the gist's orchestration file describe the same two mechanisms. The first version of this review compressed them into two bullets; they deserve their own treatment because they are the most transferable part of the whole thing.
+
+### A. Surviving context compaction
+
+His premise: the host's auto-compaction summarizer cannot be trusted to preserve workflow state or hard constraints. What it drops first is exactly what matters most: which stage you were in, what the human already approved, and the rules that say "do not commit without asking". So the agent must never depend on conversation history for any of that.
+
+What the gist does, concretely:
+
+1. **State lives on disk, not in the transcript.** A directory of five small numbered Markdown files, about 60 lines and under 500 tokens in total, in a per-session directory outside the repo (`~/.cache/agent-scars/<repo-hash>-<branch>/state/` in CLI mode, mode 0700). The numbering is the init.d trick: lexical order is read order, so the governance file always loads first.
+2. **Existence-based activation guard, evaluated every turn.** "If the state directory exists, `cat` its files before any other action." It is not "after compaction"; it runs on every turn, so it does not depend on the model noticing that compaction happened. This is Target 0 of the DAG and has no prerequisites.
+3. **Write discipline per file.**
+   - `00_governance.md` is written once at branch cut and never changed. It holds the non-negotiables (orchestrator never edits code; human gates at commit, push, land) and, importantly, an index of the exact reference filenames so a post-compaction turn never guesses paths (`SCAR-PROC-114`).
+   - `10_ticket.md` is written at claim: ticket ID, URL, branch, base SHA, core requirements.
+   - `20_plan_approved.md` is written only when the human approves the plan.
+   - `30_critic_summary.md` is append-only, one line per review round with verdict and SHA-256 of the diff reviewed.
+   - `99_next_action.md` is overwritten at every stage transition. It is the "Memento tattoo": ticket link, PR link, active target, what it is waiting on, last completed step, next permitted action, plus a checklist of every stage with the literal make rule and the evidence that satisfied it.
+4. **Never write state speculatively.** While a subagent or background task is running, the orchestrator yields and does not touch `99_next_action.md` (`SCAR-PROC-111`). State records what happened, never what is expected to happen.
+5. **Never delete the state directory.** On finish, `99_next_action.md` is left as a fully checked "tombstone" (`SCAR-PROC-101`).
+6. **A fixed post-compaction first turn.** When the host signals a resume from compaction: no write tools, no subagent spawns. Read the state files, list running subagents and reap zombies, run `git status -s`, emit the stage header. Only then act.
+7. **State over history.** The frontier is derived from physical predicates (does the plan file exist, is the tree dirty, is HEAD ahead of remote, is the PR open), so even a wrong summary cannot push the agent to the wrong stage.
+8. **The skill itself must fit in one read.** His 42 KB limit on `SKILL.md` exists because a truncated skill reload after compaction silently loses the last targets.
+9. **Transcripts as episodic memory.** When working memory loses an earlier decision, the on-disk transcript is a legitimate store to query by index (`SCAR-META-07`), with the caveat that compacted logs may be truncated.
+10. **A human-readable readerboard.** Because the state is plain files, `watch -n 1 head -n 20 state/*.md` gives the operator a live dashboard.
+
+What this looks like in Claude Code:
+
+- `CLAUDE.md` already plays the role of `00_governance.md`: it is re-injected after compaction regardless of what the summarizer kept. Put the non-negotiables there, not in the state dir.
+- The per-ticket files (`ticket.md`, `plan.md`, `critic.md`, `next_action.md`) go in a directory outside the repo, keyed by repo and branch.
+- Use a `SessionStart` hook with matchers `compact`, `resume`, and `startup` to print those files. Hook stdout is injected into the context, so the bootloader step is enforced by the harness and never depends on the model remembering to do it.
+- Use a `PreCompact` hook to snapshot physical state mechanically before the summarizer runs: branch, `git status --short`, last three commits, ahead/behind, open PR number. Write that to the state dir so the post-compaction hook prints it. This captures the things the model forgot to write down.
+- At a human gate, run `/compact` yourself with an instruction naming what to keep (ticket, approved plan, last verdict, next action). A compaction you trigger at a clean boundary is far less lossy than one that fires mid-task.
+- Session transcripts under `~/.claude/projects/` are the episodic store if you ever need to recover an earlier decision.
+
+### B. Avoiding context bloat with subagents
+
+His premise: the orchestrator's context fills up because it reads large files, runs verbose test suites, pages through package sources, and polls on long-running work. If the orchestrator never does any of that, its context stays at 15k to 30k tokens and compaction becomes structurally impossible. He frames it as Unix `fork()` and `wait()`: the parent only dispatches and collects exit status.
+
+What the gist does, concretely:
+
+1. **Depth-0 orchestrator with a strict job description.** It evaluates the DAG, writes state files, enforces gates, and forks workers. It is prohibited from editing source, running test suites, doing multi-file searches, or inspecting package sources in its own context (`SCAR-PROC-95`, `SCAR-PROC-98`).
+2. **One ephemeral worker per phase, each loading only its phase's rules.** Archaeologist (read-only, at most 15 file reads, returns the plan in its final message), TDD coder (writes code, runs tests, returns files changed and test counts), adversarial critic (read-only, different model, returns a verdict), bot triager (returns a triage matrix). Each worker reads its own reference file as step one, writes artifacts to disk, returns a short summary, and exits.
+3. **Zero-call budget after the worker returns.** Once the archaeologist has reported, the orchestrator may not do its own follow-up source lookups. One ticket hit compaction because the parent made 26 post-worker source reads (`SCAR-PROC-113`, `SCAR-PROC-114`). If more lookup is needed, message the worker or fork another.
+4. **Workers cannot write orchestrator state.** They write to a scratch dir; only the orchestrator writes the state files. Pass file paths between them, not contents: the diff is rendered once to `branch.diff` and the critic is given the path.
+5. **Bounded polling.** When the orchestrator checks on a worker it reads only the tail of the worker's transcript, capped at about 300 tokens per poll. Reading from line one once injected 68,844 tokens and triggered compaction.
+6. **Watchdog and zombie reaping.** Workers get a 90-second timer. On fire: still working means re-arm; idle without a final message, or stalled at a checkpoint (workers can compact too) means harvest the checkpoint summary and kill. Never kill an actively running critic and never fabricate its verdict (`SCAR-PROC-109`, `SCAR-PROC-110`).
+7. **The critic is single-shot.** Never converse with it; a new round is a fresh instance. One session hid two rejections and 50+ covert tool calls behind a back-channel with a persistent critic (`SCAR-PROC-89`).
+8. **Output shaping.** One line per issue when listing (multi-line JSON gets head-truncated and hides the newest items), header-only reads of binary fixtures, no `sleep` in shell commands (use the scheduler and yield the turn).
+9. **Thinking budgets by role.** Low effort for the orchestrator, high-capacity model for the critic.
+
+What this looks like in Claude Code:
+
+- The `Agent` tool gives each subagent its own context window; only its final report comes back to the parent. That is the fork/wait primitive, and it already covers points 2, 4 and 5 without any transcript polling.
+- Custom agents in `.claude/agents/` with restricted tool lists implement the roles: a critic with Read, Grep and Glob only; a coder with Edit and Bash but told never to run git commit or push.
+- Background agents notify the parent on completion, so the 90-second watchdog and zombie detection are unnecessary. Do not poll.
+- Worktree isolation on the `Agent` tool gives a worker its own checkout, which is his "ephemeral worktree" pattern for free.
+- The orchestrator discipline still has to be written down, in `CLAUDE.md` or the skill: delegate reads of large files, run test suites through a worker or redirect output to a file and read the tail, never page through package sources in the main session, pass paths not contents, and never spawn a second critic to argue with the first.
+- Model selection per agent (a stronger model for the critic, a cheaper one for archaeology) maps directly to his two-tier budget.
+
 ## What is strong
 
 - **State-based frontier resolution.** Deciding the next step from observable state rather than from conversation history is the single best idea here. It makes the workflow idempotent and resumable after compaction, a crash, or a new session.
@@ -72,18 +132,28 @@ Adopt the three ideas, not the artifact. Reimplement them with Claude Code's nat
 SCARS.md                        # grows one entry per real failure
 ```
 
-Hook example (`.claude/settings.json`):
+Hook example (`.claude/settings.json`). The SessionStart hook is the bootloader: its stdout is injected into the context after a compaction, resume, or fresh start. The PreCompact hook snapshots physical git state mechanically so it survives even if the model never wrote it down.
 
 ```json
 {
   "hooks": {
     "SessionStart": [
       {
-        "matcher": "compact|resume",
+        "matcher": "compact|resume|startup",
         "hooks": [
           {
             "type": "command",
-            "command": "d=\"$HOME/.cache/agent-state/$(basename \"$PWD\")-$(git branch --show-current 2>/dev/null)\"; [ -d \"$d\" ] && cat \"$d\"/*.md || true"
+            "command": "d=\"$HOME/.cache/agent-state/$(basename \"$PWD\")-$(git branch --show-current 2>/dev/null)\"; [ -d \"$d\" ] && { echo '## Restored ticket state (read before acting)'; cat \"$d\"/*.md; } || true"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "d=\"$HOME/.cache/agent-state/$(basename \"$PWD\")-$(git branch --show-current 2>/dev/null)\"; [ -d \"$d\" ] && { { echo '# 95_git_snapshot (auto, pre-compaction)'; git status --short --branch; git log --oneline -3; } > \"$d/95_git_snapshot.md\"; } || true"
           }
         ]
       }
@@ -91,6 +161,19 @@ Hook example (`.claude/settings.json`):
   }
 }
 ```
+
+State directory layout, mirroring his numbering so lexical order is read order:
+
+```
+~/.cache/agent-state/<repo>-<branch>/
+  10_ticket.md        written at claim: issue URL, branch, base SHA, requirements
+  20_plan.md          written only after the human approves the plan
+  30_critic.md        append-only: one line per review round, verdict + diff hash
+  95_git_snapshot.md  written by the PreCompact hook
+  99_next_action.md   overwritten at every stage transition; never deleted
+```
+
+The governance rules (`00_governance.md` in his layout) belong in `CLAUDE.md`, which Claude Code re-injects after compaction on its own.
 
 Scar entry template (`SCARS.md`):
 
