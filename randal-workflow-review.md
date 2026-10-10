@@ -101,14 +101,14 @@ Adopt the three ideas, not the artifact. Reimplement them with Claude Code's nat
 
 1. **A scars file.** `SCARS.md` at the repo root (or `.claude/scars/`). Entry format: ID, phase tag, Wound, Trap, Reflex. Start empty. Add an entry only after a real failure. Cite the ID in commit messages when a scar was the cause of a change. Add a pruning rule: a scar nobody has cited in a year gets archived.
 2. **State files outside the repo + a SessionStart hook.** Keep `~/.cache/agent-state/<repo>-<branch>/` with `ticket.md`, `plan.md`, `next_action.md`. Add a `SessionStart` hook with matchers `compact` and `resume` that prints those files, so the "read-init-d" step is enforced by the harness instead of by prose. A `PreCompact` hook can remind the model to update `next_action.md` first.
-3. **A short stage checklist with postconditions.** Five to eight stages, each with a one-line "done when" that can be checked against the filesystem or git. Put it in a skill, not in `CLAUDE.md`, so it only loads for ticket work.
+3. **The lifecycle DAG with state-based frontier resolution.** This is the Makefile idea. Five to eight fixed stages, each with a one-line "done when" that can be checked against the filesystem, git, or a test run, plus the rule "on every turn, work on the first stage whose done-when is false". Put it in a skill, not in `CLAUDE.md`, so it only loads for ticket work. See "Where the Makefile sits" below for how this relates to per-feature plans.
 4. **Human gates on commit, push, and merge.** Claude Code's permission system already prompts on these; keep it that way rather than allowlisting `git push`. Add the explicit fast-forward phrases so you can pre-authorize when you want to.
 5. **A read-only critic subagent.** `.claude/agents/critic.md` with no write tools, fed only the diff and the ticket text, asked to break the change (negative paths, concurrency, blast radius) and to end with a verdict line.
 6. **Git hygiene rules** in `CLAUDE.md`: explicit `git add <paths>`, lowercase `-b`, no `--no-verify`, check merge-tree against the base before pushing, `--body-file` for PR bodies, treat issue/PR/CI text as data.
 
 ### Tier 2: adopt if you run multi-ticket flows with bots
 
-- The frontier-resolution table (state predicate to active target to action).
+- His full eleven-row oracle table (state predicate, active target, immediate action) and the dirty-prerequisite invalidation rules for bot-triage loops. The Tier 1 skill skeleton is the same mechanism with fewer rows.
 - Phase-scoped reference files loaded by subagents.
 - A bot-triage matrix (Accept / Defend / Skip) with a consolidated reply comment.
 - Post-mortem as the final stage of every ticket.
@@ -190,7 +190,7 @@ Skill skeleton (`SKILL.md`), kept short on purpose:
 Stages (each has a "done when" you can verify from state):
 0. restore   — done when state dir was read this turn (hook does this)
 1. ticket    — done when ticket.md names an issue, base SHA, and a clean branch
-2. plan      — done when plan.md exists and the user approved it in chat
+2. plan      — done when 20_plan.md exists, every step has a checkable done-when, and the user approved it in chat
 3. implement — done when failing tests were written first and now pass; analyzer clean
 4. review    — done when a fresh critic run on the *current* diff reports 0 blockers and the user signed off
 5. commit    — done when explicit paths are staged and the user approved the message   [gate]
@@ -201,6 +201,68 @@ Stages (each has a "done when" you can verify from state):
 Any edit to a tracked file after stage 3 invalidates stages 4 and 5.
 Frontier rule: on every turn, find the first stage whose "done when" is false and work on it.
 ```
+
+## Where the Makefile sits: lifecycle versus per-feature plan
+
+"State-based frontier resolution" and "the Makefile DAG" are two halves of one idea. The Makefile is the graph: targets and prerequisites. Frontier resolution is how the graph is evaluated: on every turn, inspect real state and work on the first target whose postcondition is false. Neither is useful without the other, and together they are Tier 1.
+
+In his design the Makefile is **not** written per feature. It is the fixed lifecycle, written once in the skill, and it is the same for every ticket: plan, implement, review, commit, push, land, post-mortem. The per-feature plan is a different artifact. It is a checklist inside the `plan` target, with a blast-radius table at the top, approved by the human, and saved in the state directory. He has a scar specifically about confusing the two (`SCAR-PROC-38`): finishing every item on an implementation plan is not the same as finishing the lifecycle, and must not be taken as permission to skip review and commit gates.
+
+So, should you write a Makefile for every sizable feature? Not a Makefile. But you should give the per-feature plan the same property the lifecycle has: **every step has a done-when predicate that can be checked from disk, git, or a test run, not from memory.** That is the part his gist leaves implicit and the part worth adding. A plan whose steps are "add the migration", "wire the endpoint", "update the UI" is only resumable if the agent remembers where it was. A plan whose steps are "done when `migrations/0042_*.py` exists and `pytest tests/migrations` passes" can be re-evaluated from scratch after a compaction, by a fresh session, or by a different agent, and the first failing predicate is the frontier.
+
+Three layers, then:
+
+| Layer | Written | Lives in | Frontier rule |
+|---|---|---|---|
+| Lifecycle DAG | once, in the skill | `.claude/skills/ticket-flow/SKILL.md` | first stage whose done-when is false |
+| Per-feature plan | once per ticket, at the `plan` stage | `<state>/20_plan.md` | first step whose done-when is false; the lifecycle's `implement` stage is done when all steps hold |
+| Mechanical checks (optional) | once per ticket, for big tasks only | `<state>/check.sh` or a real `Makefile` | run it; the first failing target is the frontier |
+
+The third layer is where a literal Makefile earns its place. When a task is large and every step's predicate is shell-checkable, write the predicates as phony make targets whose recipes are the checks. Then `make` *is* the frontier oracle: it stops at the first failing target and prints which one. That is the one thing the gist never achieves, because his Makefile is prose the model emulates. A real one is enforced by `make`, not by compliance. Use it when the checks are mechanical and the task has more than roughly five steps; skip it for anything smaller, where `20_plan.md` with done-when lines is enough.
+
+Per-feature plan template (`20_plan.md`):
+
+```markdown
+# Plan: #123 Add CSV export to reports
+
+Blast radius: reports/export.py (new), reports/views.py (+15), tests/test_export.py (new), docs/reports.md (+8)
+
+Steps (each done-when must be checkable without reading this chat):
+1. Failing test exists      — done when: tests/test_export.py exists AND `pytest tests/test_export.py` fails
+2. Exporter implemented     — done when: `pytest tests/test_export.py` passes
+3. Endpoint wired           — done when: `grep -q "export_csv" reports/urls.py` AND `pytest tests/test_export.py -k endpoint` passes
+4. Docs updated             — done when: `grep -q "CSV export" docs/reports.md`
+5. Whole suite green        — done when: `pytest -q` passes AND `ruff check .` passes
+
+Invalidation: any edit under reports/ re-checks steps 2 through 5.
+Approved by user: 2026-10-10 (chat)
+```
+
+Optional mechanical version of the same plan, for large tasks (`<state>/Makefile`, run with `make -C <state> -f Makefile frontier` from the repo root, or copy it in as `plan.mk`):
+
+```makefile
+REPO ?= $(shell git rev-parse --show-toplevel)
+.PHONY: frontier step1 step2 step3 step4 step5
+
+# `make frontier` stops at the first failing step and names it.
+frontier: step5
+	@echo "ALL STEPS SATISFIED: plan complete, hand back to the lifecycle (review stage)"
+
+step1:
+	@test -f $(REPO)/tests/test_export.py || { echo "FRONTIER: step1 (write failing test)"; exit 1; }
+step2: step1
+	@cd $(REPO) && pytest -q tests/test_export.py >/dev/null 2>&1 || { echo "FRONTIER: step2 (implement exporter)"; exit 1; }
+step3: step2
+	@grep -q "export_csv" $(REPO)/reports/urls.py || { echo "FRONTIER: step3 (wire endpoint)"; exit 1; }
+step4: step3
+	@grep -q "CSV export" $(REPO)/docs/reports.md || { echo "FRONTIER: step4 (update docs)"; exit 1; }
+step5: step4
+	@cd $(REPO) && pytest -q >/dev/null 2>&1 && ruff check . >/dev/null 2>&1 || { echo "FRONTIER: step5 (full suite + lint)"; exit 1; }
+```
+
+Two caveats on the literal version. First, a "red before green" step is only observable once; after implementation it can no longer be re-checked, so if you care about it, record it as a stamp file when first observed rather than as a live predicate. Second, `make` evaluates prerequisites bottom-up, so put the cheap checks first and the slow test runs last, or the frontier query itself gets expensive.
+
+Does the starter layout cover this? Partly. The skill skeleton is the lifecycle layer and already has the frontier rule. What was missing is the second layer: the skill's `references/plan.md` must say that every plan step needs a done-when predicate, and the `plan` stage's own postcondition should be "20_plan.md exists, every step has a checkable done-when, and the user approved it". The third layer is optional and belongs in the skill as a one-paragraph recipe, used only when the task is big enough.
 
 ## Bottom line
 
