@@ -91,7 +91,7 @@ What this looks like in Claude Code:
 - **Tooling is Antigravity-specific.** `invoke_subagent`, `define_subagent`, `schedule`, `<brain>/`, `agy-hub` artifacts pane, `UserFacing` metadata, 42 KB `view_file` "hardware ceiling". Claude Code has different (and in some cases better) primitives for each.
 - **Faux-mathematical notation.** Every rule is restated as a LaTeX predicate. It adds tokens and an air of rigor without adding precision.
 - **Ceremony.** Six human gates, a 180-second four-bot quiescence timer, 90-second subagent watchdogs, SHA-256 receipts of the diff. This is tuned for a solo maintainer running many parallel agent conversations on mature open-source packages. For a small project it will slow you down more than it saves.
-- **Enforcement is still prompt compliance.** The Makefile is a metaphor. The "gates" hold only as long as the model obeys the prose. Real enforcement needs hooks or permissions.
+- **Enforcement is still prompt compliance.** The Makefile is a metaphor. The "gates" hold only as long as the model obeys the prose. Real enforcement needs hooks or permissions. (Part 3.8 adds a fair counterpoint: the Makefile *form* is still worth keeping because the model parses it more reliably than prose. See the update section below.)
 
 ## Should you adopt it?
 
@@ -167,8 +167,10 @@ State directory layout, mirroring his numbering so lexical order is read order:
 ```
 ~/.cache/agent-state/<repo>-<branch>/
   10_ticket.md        written at claim: issue URL, branch, base SHA, requirements
+  15_facts.md         facts the plan rests on, each VERIFIED | ASSUMED | CONFLICT | RETRACTED (optional; or a table inside 20_plan.md)
   20_plan.md          written only after the human approves the plan
   30_critic.md        append-only: one line per review round, verdict + diff hash
+  40_approvals.md     append-only: one line per human gate the user approved in chat, e.g. "human-plan-approval: approved <timestamp>"
   95_git_snapshot.md  written by the PreCompact hook
   99_next_action.md   overwritten at every stage transition; never deleted
 ```
@@ -184,22 +186,52 @@ Scar entry template (`SCARS.md`):
 - Reflex: always lowercase `-b`. If the branch exists, inspect it with `git log origin/main..<branch>` before switching.
 ```
 
-Skill skeleton (`SKILL.md`), kept short on purpose:
+Skill skeleton (`SKILL.md`), kept short on purpose. It is written in Makefile syntax deliberately: nothing executes it, but the form carries dependency semantics the model already knows (Part 3.8's argument). Each recipe line is the stage's done-when predicate; a `[human]` prerequisite is a gate that only the user can satisfy in chat.
 
-```markdown
-Stages (each has a "done when" you can verify from state):
-0. restore   — done when state dir was read this turn (hook does this)
-1. ticket    — done when ticket.md names an issue, base SHA, and a clean branch
-2. plan      — done when 20_plan.md exists, every step has a checkable done-when, and the user approved it in chat
-3. implement — done when failing tests were written first and now pass; analyzer clean
-4. review    — done when a fresh critic run on the *current* diff reports 0 blockers and the user signed off
-5. commit    — done when explicit paths are staged and the user approved the message   [gate]
-6. push      — done when merge-tree against base is clean and the PR exists            [gate]
-7. land      — done when CI is green, threads resolved, and the user said "land"       [gate]
-8. postmortem— done when SCARS.md has an entry for every human correction this ticket
+```makefile
+# Lifecycle DAG. Frontier rule: on every turn, inspect real state and work on the
+# first target whose recipe (its done-when check) would fail. Never skip a [human] gate.
+STATE := $(HOME)/.cache/agent-state/$(REPO)-$(BRANCH)
 
-Any edit to a tracked file after stage 3 invalidates stages 4 and 5.
-Frontier rule: on every turn, find the first stage whose "done when" is false and work on it.
+.PHONY: finish postmortem land push commit review implement plan ticket restore
+.PHONY: human-plan-approval human-review-approval human-commit-approval human-push-approval human-landing-approval
+
+finish: land postmortem
+
+postmortem: land
+	@test -s $(STATE)/scars_this_ticket.md        # one SCARS.md entry per human correction this ticket
+
+land: push human-landing-approval
+	@gh pr checks --required && test "$$(gh pr view --json mergeStateStatus -q .mergeStateStatus)" = CLEAN
+
+push: commit human-push-approval
+	@! git merge-tree $$(git merge-base HEAD origin/main) HEAD origin/main | grep -q '^<<<<<<<' && gh pr view >/dev/null
+
+commit: review human-commit-approval
+	@git diff --cached --name-only | grep -q . && ! git diff --cached --name-only | grep -q '^\.tmp/'
+
+review: implement human-review-approval
+	@grep -q 'VERDICT: 0 BLOCKERS' $(STATE)/30_critic.md    # and dated after the last tracked-file edit
+
+implement: plan
+	@$(MAKE) -s -f $(STATE)/plan.mk frontier       # every plan step's done-when holds; tests were red first
+
+plan: ticket human-plan-approval
+	@test -s $(STATE)/20_plan.md && ! grep -q '| CONFLICT |' $(STATE)/20_plan.md
+
+ticket: restore
+	@test -s $(STATE)/10_ticket.md && test -z "$$(git status --porcelain)"
+
+restore:
+	@true   # SessionStart hook already printed $(STATE)/*.md this turn
+
+# Gates: satisfied only by the user saying so in chat. The agent never marks these done itself.
+# A conditional pre-approval ("if green, land") is a condition checked at the gate, not a trigger.
+human-plan-approval human-review-approval human-commit-approval human-push-approval human-landing-approval:
+	@grep -q "^$@: approved" $(STATE)/40_approvals.md
+
+# Invalidation: any edit to a tracked file after `implement` dirties `review` and `commit`.
+# A disproved fact in 20_plan.md's facts table dirties `plan`.
 ```
 
 ## Where the Makefile sits: lifecycle versus per-feature plan
@@ -227,7 +259,15 @@ Per-feature plan template (`20_plan.md`):
 
 Blast radius: reports/export.py (new), reports/views.py (+15), tests/test_export.py (new), docs/reports.md (+8)
 
-Steps (each done-when must be checkable without reading this chat):
+Facts this plan rests on (no approval while any row is CONFLICT; a disproved row re-opens the plan):
+| # | Fact                                                   | Status   | Evidence                          |
+|---|--------------------------------------------------------|----------|-----------------------------------|
+| 1 | Reports are rendered by reports/views.py:ReportView    | VERIFIED | read file, grep "class ReportView"|
+| 2 | No existing export code anywhere in reports/           | VERIFIED | `git grep -i export -- reports/` empty |
+| 3 | CSV must be UTF-8 with BOM for the customer's Excel    | ASSUMED  | issue text; not confirmed by user |
+| 4 | Issue says "all columns"; docstring says "visible only"| CONFLICT | ask user before step 2            |
+
+Steps (each done-when must be checkable without reading this chat; multi-command checks join with && so no failure is masked):
 1. Failing test exists      — done when: tests/test_export.py exists AND `pytest tests/test_export.py` fails
 2. Exporter implemented     — done when: `pytest tests/test_export.py` passes
 3. Endpoint wired           — done when: `grep -q "export_csv" reports/urls.py` AND `pytest tests/test_export.py -k endpoint` passes
@@ -263,6 +303,37 @@ step5: step4
 Two caveats on the literal version. First, a "red before green" step is only observable once; after implementation it can no longer be re-checked, so if you care about it, record it as a stamp file when first observed rather than as a live predicate. Second, `make` evaluates prerequisites bottom-up, so put the cheap checks first and the slow test runs last, or the frontier query itself gets expensive.
 
 Does the starter layout cover this? Partly. The skill skeleton is the lifecycle layer and already has the frontier rule. What was missing is the second layer: the skill's `references/plan.md` must say that every plan step needs a done-when predicate, and the `plan` stage's own postcondition should be "20_plan.md exists, every step has a checkable done-when, and the user approved it". The third layer is optional and belongs in the skill as a one-paragraph recipe, used only when the task is big enough.
+
+## Update, 2026-10-11: Part 3.8 and the gist's new revision
+
+Part 3.8 is titled "What LLMs 'Know' That You Don't Know They Know: Stop Inventing Prompt DSLs and Ride 50 Years of Unix Pre-Training Gravity". I could not read it: dev.to, the Internet Archive and reader proxies are all blocked from this environment. What follows about the article comes from two independent summaries (a search engine's and an automated digest's), both of which agree on the thesis. The gist itself was revised the same day, and that revision I did read in full and diffed against the previous one.
+
+### What Part 3.8 argues
+
+The claim: a model has seen Makefiles, `/etc/init.d`, `fork()`/`wait()`, exit codes, cron tables and shell pipelines millions of times in pre-training. It has seen your invented bracketed tags and bespoke prompt grammar zero times. Zero-shot reliability scales with how often a structural pattern appeared in the corpus (he cites Razeghi et al. and Kandpal et al.). So write agent instructions in the formalisms the model already knows, instead of inventing a prompt DSL. He contrasts this against a 2,000-line English prompt and offers a "10-primitive Rosetta Stone" mapping agent-skill needs to Unix primitives. I do not have the list of ten and will not guess it. The gist does not contain it either; only the README links the article.
+
+The evidence for the scaling claim is two papers I have not checked, and the performance comparison against the long prompt is his own, unpublished. Treat the mechanism as plausible and the magnitude as unverified.
+
+### What changed in the gist revision
+
+The diff is mostly consolidation (the scar catalog grew a fourth shard, the orchestration file shrank by a quarter) plus sixteen new scars. Most of the new scars are Dart, Flutter, AST-lint and Antigravity scheduler specifics. Four are general enough to matter:
+
+- **`SCAR-PROC-120`, a typed facts ledger.** A new state file, `15_archaeology_receipt.md`, records every fact the planner relies on with one of four statuses: `ESTABLISHED`, `CONTRADICTED`, `UNKNOWN`, `RETRACTED`. Planning is not allowed to proceed while any fact is `CONTRADICTED`. When a test or a human correction disproves a fact, it is marked `RETRACTED` and every fact that depended on it drops back to `UNKNOWN`, and if a plan premise was affected the lifecycle rolls back to the plan stage. The wound behind it: prose archaeology notes blur verified facts with assumptions, and the planner quietly averages conflicting specs into a hybrid plan.
+- **`SCAR-PROC-116`, exit-code masking.** A multi-line shell block without `set -euo pipefail` or `&&` let a failing format check hide behind a succeeding `git status`. Any "done when" predicate written as several shell lines has this bug.
+- **`SCAR-PROC-117`, pre-approval drift.** The human said "when CI is green, go ahead and land" while a worker was still running. The agent treated the sentence as a trigger, killed the worker, and merged a PR whose merge state was `UNSTABLE`. The fix: a conditional pre-approval is a condition to evaluate at the gate, not a command to act on now, and the merge check must assert `CLEAN`, never `UNSTABLE`.
+- **`SCAR-PROC-118` and `119`, acting before a background task returns.** After dispatching a background task, the orchestrator issued more tool calls that presumed its result. In Claude Code terms: after you spawn a background agent, do nothing that depends on its answer until the notification arrives.
+
+### Does it change the adoption?
+
+Not the shape of it. Three things move.
+
+1. **Keep the lifecycle in Makefile syntax, even though nothing executes it.** My first review said the Makefile is a metaphor and enforcement is still prompt compliance. That is still true, but Part 3.8 gives a reason the metaphor pays for itself anyway: the form is load-bearing. A `target: prereq` block is a pattern the model has parsed countless times, with dependency semantics attached; a numbered prose list with "done when" clauses is not. So the skill skeleton below is now written as a Makefile, with the done-when predicates as recipe lines. Where a predicate is a real shell command it is doubly good: the model knows shell better than anything.
+2. **Add a small facts ledger to the plan.** Not his bitemporal version with validity intervals. A table in the plan with each fact the plan rests on and a status of `VERIFIED`, `ASSUMED`, or `CONFLICT`, and two rules: no plan approval while a `CONFLICT` row is open, and a disproved fact dirties the plan stage. This is cheap and it catches the most expensive class of agent failure, which is building correctly on a false premise.
+3. **Write predicates so they cannot mask failures.** Every multi-command predicate joins with `&&`, or runs under `set -euo pipefail`. A make recipe already stops on the first failing line, which is one more argument for the literal Makefile on big tasks.
+
+Two things it reinforces rather than changes. First, my advice to use Claude Code's native mechanisms (hooks, `CLAUDE.md`, agents, settings) instead of a custom notation is exactly Part 3.8's argument applied to the harness: those are the formats this model was trained and tuned on. Second, the catalog grew by sixteen scars in a day, almost all of them specific to one Dart monorepo and one IDE's scheduler. That is the pruning problem in action, and it is the strongest reason to start your own `SCARS.md` empty.
+
+One thing it argues against in my earlier review, mildly. I dismissed his LaTeX restatements of each rule as noise. By his own thesis, mathematical notation is also high-frequency in pre-training, so the form is defensible. The content of each formula is still idiosyncratic, so I stand by "skip them", but the reason is their bespoke semantics, not the notation.
 
 ## Bottom line
 
